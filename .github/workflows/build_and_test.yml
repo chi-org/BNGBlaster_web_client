@@ -35,6 +35,12 @@ jobs:
         sleep 10  # Give the container some time to start
     - name: Check container status
       run: docker inspect streamlit-container
+
+    - name: Setup Python
+      uses: actions/setup-python@v5.3.0
+      with:
+        python-version: "3.13"
+
     - name: Run Robot Framework tests
       run: |
         pip install git+https://github.com/robotframework/SeleniumLibrary.git
