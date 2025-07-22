@@ -1,0 +1,20 @@
+{
+    "branches": ["main"],
+    "repositoryUrl": "https://github.com/chi-org/BNGBlaster_web_client",
+    "plugins": [
+        [
+            "@semantic-release/commit-analyzer",
+            {
+                "preset": "angular",
+                "releaseRules": [
+                    {
+                        "type": "breaking",
+                        "release": "major"
+                    }
+                ]
+            }
+        ],
+        "@semantic-release/release-notes-generator",
+        "@semantic-release/github"
+    ]
+}
