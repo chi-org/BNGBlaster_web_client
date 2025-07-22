@@ -186,6 +186,7 @@ jobs:
         fi
       continue-on-error: true
 
+      
     - name: Send mail to committer if detect vulnerability in Docker image
       if: steps.scan_docker_image.outputs.detected_vulns == 'true'
       uses: dawidd6/action-send-mail@v4
