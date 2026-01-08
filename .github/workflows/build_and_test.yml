@@ -34,6 +34,12 @@ jobs:
     permissions:
       contents: read
       packages: write
+      security-events: write
+    outputs:
+      check_no_ci: ${{ steps.check_commit_message.outputs.no_ci }}
+      check_no_scan: ${{ steps.check_commit_message.outputs.no_scan }}
+      check_no_cache: ${{ steps.check_commit_message.outputs.no_cache }}
+      is_latest_or_release_image: ${{ steps.check_existing_image.outputs.is_latest_or_release_image }}
     steps:
       
     - name: Checkout code
@@ -49,7 +55,28 @@ jobs:
         echo "COMMIT_SHORT_ID=${{ env.COMMIT_SHORT_ID }}"
         echo "REPO=${{ env.REPO }}"
 
+    ## Check commit message for no-ci, no-scan, no-cache
+    - name: Check commit message
+      id: check_commit_message
+      run: |
+        commit_message=$(git log --pretty=format:"%H %s %b" | grep "${{ env.COMMIT_FULL_ID }}" | sed 's,'${{ env.COMMIT_FULL_ID }}' ,,g')
+
+        if [[ "$commit_message" =~ .*"no-ci".* ]]; then
+            echo "❌ Found 'no-ci' in commit message. Stopping workflow!"
+            echo "no_ci=true" >> $GITHUB_OUTPUT
+
+        elif [[ "$commit_message" =~ .*"no-scan".* ]]; then
+            echo "🛑 Found 'no_scan' in commit message. Skipping image and Dockerfile scan!"
+            echo "no_scan=true" >> $GITHUB_OUTPUT
+            
+        elif [[ "$commit_message" =~ .*"no-cache".* ]]; then
+            echo "⚡ Found 'no_cache' in commit message. Skipping caching during image build!"
+            echo "no_cache=true" >> $GITHUB_OUTPUT
+        fi
+
+    ## Check existing image in GHCR to skip building if image with commit ID tag is existed
     - name: Check existing image in GHCR
+      if: steps.check_commit_message.outputs.no_ci != 'true'
       id: check_existing_image
       run: |
         REPO_NAME=$(echo ${{ env.REPO }} | cut -d'/' -f2)
@@ -75,207 +102,133 @@ jobs:
         fi
 
     - name: Get Job ID
+      if: steps.check_commit_message.outputs.no_ci != 'true'
       id: get_job_id
       run: |
-        curl -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+        job_id=$(curl -s -H "Authorization: Bearer ${{ secrets.PUSH_TOKEN }}" \
         "https://api.github.com/repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/jobs" \
-        | jq '.jobs[] | select(.name=="build") | .id' > job_id.txt
-        echo "job_id=$(cat job_id.txt)" >> $GITHUB_OUTPUT
+        | jq --arg job "${{ github.job }}" '.jobs[] | select(.name==$job) | .id')
 
-    - name: Determine Commit ID and Comitter Email
-      id: determine_commit_id_and_email_author
+        echo "job_id=$job_id" >> $GITHUB_OUTPUT
+
+    - name: Get Commit ID and Committer Info
       run: |
-        if [[ ${{ github.event_name }} == 'workflow_dispatch' ]]; then
-          COMMIT_ID=${{ github.event.inputs.commit_id }}
-          COMMIT_AUTHOR_EMAIL=$(git show -s --format='%ae' $COMMIT_ID)
-          COMMIT_AUTHOR_NAME=$(git show -s --format='%aN' $COMMIT_ID)
-        else
-          COMMIT_ID=${{ github.event.head_commit.id }}
-          COMMIT_AUTHOR_EMAIL=${{ github.event.head_commit.author.email }}
-          COMMIT_AUTHOR_NAME=${{ github.event.head_commit.author.name }}
+        COMMIT_ID=${{ env.COMMIT_FULL_ID }}
+
+        # Get committer info
+        echo "Getting committer info for commit ID: $COMMIT_ID"
+        COMMITTER_EMAIL=$(git show -s --format='%ce' $COMMIT_ID)
+        COMMITTER_NAME=$(git show -s --format='%cn' $COMMIT_ID)
+
+        # Get author info if committer email is noreply
+        if [[ "$COMMITTER_EMAIL" == *noreply* ]]; then 
+          echo "Committer email is noreply, getting author info..."
+          COMMITTER_NAME=$(git show -s --format='%an' $COMMIT_ID)
+          COMMITTER_EMAIL=$(git show -s --format='%ae' $COMMIT_ID)
         fi
 
-        echo "COMMIT_ID=${COMMIT_ID}" >> $GITHUB_OUTPUT
-        echo "COMMIT_AUTHOR_EMAIL=${COMMIT_AUTHOR_EMAIL}" >> $GITHUB_OUTPUT
-        echo "COMMIT_AUTHOR_NAME=${COMMIT_AUTHOR_NAME}" >> $GITHUB_OUTPUT
+        # Fallback to github event info if still noreply
+        if [[ "$COMMITTER_EMAIL" == *noreply* ]]; then 
+          echo "Committer email is still noreply, using github event info..."
+          COMMITTER_NAME=${{ github.event.pusher.name || github.event.sender.login }}
+          COMMITTER_EMAIL=${{ github.event.pusher.email}}
+        fi
 
+        echo "COMMIT_ID=${COMMIT_ID}" >> $GITHUB_ENV
+        echo "COMMITTER_NAME=${COMMITTER_NAME}" >> $GITHUB_ENV
+        echo "COMMITTER_EMAIL=${COMMITTER_EMAIL}" >> $GITHUB_ENV
+        echo "COMMIT_ID: $COMMIT_ID"
+        echo "COMMITTER_NAME: $COMMITTER_NAME"
+        echo "COMMITTER_EMAIL: $COMMITTER_EMAIL"   
+
+    - name: Login to Docker Container Registry
+      if: |
+        (github.event_name == 'push' || github.event_name == 'pull_request' || steps.check_existing_image.outputs.is_image_tag_by_commit_id_existed == 'false') && 
+        (steps.check_commit_message.outputs.no_ci != 'true')
+      uses: docker/login-action@v2
+      with:
+        registry: docker.io
+        username: '${{ secrets.DOCKER_HUB_USERNAME }}'
+        password: '${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}'
+    - name: Build Docker image (no cache)
+      if: |
+        (github.event_name == 'push' || github.event_name == 'pull_request' || steps.check_existing_image.outputs.is_image_tag_by_commit_id_existed == 'false') &&
+        (steps.check_commit_message.outputs.no_cache == 'true' && steps.check_commit_message.outputs.no_ci != 'true')
+      run: |
+        docker build --no-cache -t ${{ env.IMAGE_NAME }} .
     - name: Login to GitHub Container Registry
-      if: github.event_name == 'push' || github.event_name == 'pull_request' || steps.check_existing_image.outputs.is_image_tag_by_commit_id_existed == 'false'
+      if: |
+        (github.event_name == 'push' || github.event_name == 'pull_request' || 
+        steps.check_existing_image.outputs.is_image_tag_by_commit_id_existed == 'false') && 
+        steps.check_commit_message.outputs.no_ci != 'true'
       uses: docker/login-action@v2
       with:
         registry: ghcr.io
         username: '${{ github.repository_owner }}'
         password: '${{ secrets.GITHUB_TOKEN }}'
+    - name: Build Docker image (with cache)
+      if: |
+        (github.event_name == 'push' || github.event_name == 'pull_request') &&
+        (steps.check_commit_message.outputs.no_cache != 'true' && steps.check_commit_message.outputs.no_ci != 'true')
+      run: |
+        docker pull ghcr.io/${{ env.REPO }}:latest || true
+        docker build --build-arg BUILDKIT_INLINE_CACHE=1 \
+          --cache-from ghcr.io/${{ env.REPO }}:latest -t ${{ env.IMAGE_NAME }} .
 
     - name: Scan Dockerfile using Trivy and send mail if vulnerabilities detected
+      if: steps.check_commit_message.outputs.no_ci != 'true' && steps.check_commit_message.outputs.no_scan != 'true'
       uses: svtechnmaa/.github/actions/run_trivy_scan_dockerfile@main
       with:
         dockerfile_path: './Dockerfile'
-        commit_id: ${{ steps.determine_commit_id_and_email_author.outputs.COMMIT_ID }}
+        commit_id: ${{ env.COMMIT_ID }}
         mail_username: ${{ vars.MAIL_USERNAME }}
         mail_password: ${{ secrets.MAIL_PASSWORD }}
-        commit_author_email: ${{ steps.determine_commit_id_and_email_author.outputs.COMMIT_AUTHOR_EMAIL }}
-        commit_author_name: ${{ steps.determine_commit_id_and_email_author.outputs.COMMIT_AUTHOR_NAME }}
+        mail_receivers: ${{ env.COMMITTER_EMAIL }},${{ vars.DEFAULT_MAIL_RECIPIENTS }}
+        commit_author_name: ${{ env.COMMITTER_NAME }}
         job_id: ${{ steps.get_job_id.outputs.job_id }}
 
-    - name: Build Docker image
-      if: github.event_name == 'push' || github.event_name == 'pull_request' || steps.check_existing_image.outputs.is_image_tag_by_commit_id_existed == 'false'
-      run: |
-        echo ${{ steps.check_existing_image.outputs.is_image_tag_by_commit_id_existed }}
-        docker build --build-arg git_token=${{ secrets.GITHUB_TOKEN }} --build-arg CACHEBUST=$(date +%s) --build-arg BRANCH=main --build-arg OWNER=${{ github.repository_owner }} -t ${{ env.IMAGE_NAME }} .
-        
     - name: Scan Docker image using Trivy and send mail if vulnerabilities detected
+      if: steps.check_commit_message.outputs.no_ci != 'true' && steps.check_commit_message.outputs.no_scan != 'true'
       uses: svtechnmaa/.github/actions/run_trivy_scan_image@main
       with:
-        trivy_server: 'http://10.98.7.14:7777'
-        image_name: ${{ env.IMAGE_NAME }}
+        trivy_server: ${{ secrets.TRIVY_SERVER }}
+        image_name: ${{env.IMAGE_NAME}}
+        image_tag: 'latest'
         commit_id: ${{ steps.determine_commit_id_and_email_author.outputs.COMMIT_ID }}
         mail_username: ${{ vars.MAIL_USERNAME }}
         mail_password: ${{ secrets.MAIL_PASSWORD }}
-        commit_author_email: ${{ steps.determine_commit_id_and_email_author.outputs.COMMIT_AUTHOR_EMAIL }}
-        commit_author_name: ${{ steps.determine_commit_id_and_email_author.outputs.COMMIT_AUTHOR_NAME }}
+        mail_receivers: ${{ steps.determine_commit_id_and_email_author.outputs.COMMITTER_EMAIL }},${{ vars.DEFAULT_MAIL_RECIPIENTS }}
+        commit_author_name: ${{ steps.determine_commit_id_and_email_author.outputs.COMMITTER_NAME }}
         job_id: ${{ steps.get_job_id.outputs.job_id }}
 
-  #   - name: Scan Dockerfile 
-  #     id: scan_dockerfile
-  #     run: |
-  #       trivy config --severity HIGH,CRITICAL --format table --output dockerfile_scanning_result.txt ./Dockerfile
-  #       VULN_LINE=$(grep -E "Failures: [0-9]+ \(HIGH: [0-9]+, CRITICAL: [0-9]+\)" dockerfile_scanning_result.txt)
+    - name: Run BNGBlaster app
+      id: run_and_check_container_status
+      if: |
+        (github.event_name == 'push' || github.event_name == 'pull_request' || 
+        steps.check_existing_image.outputs.is_image_tag_by_commit_id_existed == 'false') && 
+        steps.check_commit_message.outputs.no_ci != 'true'
+      uses: svtechnmaa/.github/actions/run_docker_container@main
+      with:
+        imageName: '${{ env.IMAGE_NAME }}'
+        containerName: '${{ env.CONTAINER_NAME }}'
+        containerMappingPort: '${{ env.CONTAINER_MAPPING_PORT }}'
         
-  #       HIGH_COUNT=$(echo "$VULN_LINE" | awk -F'[(:,)]' '{print $4}' | tr -d ' ')
-  #       CRITICAL_COUNT=$(echo "$VULN_LINE" | awk -F'[(:,)]' '{print $6}' | tr -d ' ')
-  #       TOTAL_VULNS=$((HIGH_COUNT + CRITICAL_COUNT))
-  #       echo "HIGH vulnerabilities: $HIGH_COUNT"
-  #       echo "CRITICAL vulnerabilities: $CRITICAL_COUNT"
-  #       echo "TOTAL vulnerabilities: $TOTAL_VULNS"
-
-  #       if [ "$TOTAL_VULNS" -gt 0 ]; then
-  #         echo "detected_vulns=true" >> $GITHUB_OUTPUT
-  #       else
-  #         echo "detected_vulns=false" >> $GITHUB_OUTPUT
-  #       fi
-  #     continue-on-error: true
-
-  #   - name: Send mail to committer if detect vulnerability in Dockerfile
-  #     if: steps.scan_dockerfile.outputs.detected_vulns == 'true'
-  #     uses: dawidd6/action-send-mail@v4
-  #     with:
-  #       server_address: smtp.gmail.com
-  #       server_port: 465
-  #       secure: true
-  #       username: ${{vars.MAIL_USERNAME}}
-  #       password: ${{secrets.MAIL_PASSWORD}}
-  #       subject: "[ALERT] Vulnerabilities Found in Dockerfile"
-  #       body: |
-  #         Hello ${{ env.COMMIT_AUTHOR_NAME }},
-
-  #         Detected vulnerabilities for commit:
-  #         ${{ github.server_url }}/${{ github.repository }}/commit/${{ env.COMMIT_ID }}
-
-  #         View the full report here:
-  #         ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}/job/${{ steps.get_job_id.outputs.job_id }}
-          
-  #         Please review the details and take appropriate action.
-
-  #         Best,
-  #         SRE Team
-  #       to: ${{ env.COMMIT_AUTHOR_EMAIL }}
-  #       from: kien.kim@svtech.com.vn
-
-  #   - name: Show results for Dockerfile scanning
-  #     run: |
-  #       echo "##[command] Show results for Dockerfile scanning"
-  #       cat dockerfile_scanning_result.txt
-  #     continue-on-error: true
-
-  #   - name: Build Docker image
-  #     if: github.event_name == 'push' || github.event_name == 'pull_request' || steps.check_existing_image.outputs.is_image_tag_by_commit_id_existed == 'false'
-  #     run: |
-  #       echo ${{ steps.check_existing_image.outputs.is_image_tag_by_commit_id_existed }}
-  #       docker build -t ${{ env.IMAGE_NAME }} .
-
-  #   - id: run_and_check_container_status
-  #     if: github.event_name == 'push' || github.event_name == 'pull_request' || steps.check_existing_image.outputs.is_image_tag_by_commit_id_existed == 'false'
-  #     name: Run BNGBlaster app
-  #     uses: svtechnmaa/.github/actions/run_docker_container@main
-  #     with:
-  #       imageName: '${{ env.IMAGE_NAME }}'
-  #       containerName: '${{ env.CONTAINER_NAME }}'
-  #       containerMappingPort: '${{ env.CONTAINER_MAPPING_PORT }}'
-        
-  #   - name: Scan Docker image
-  #     id: scan_docker_image
-  #     run: |
-  #       echo "🔍 Checking Trivy server availability..."
-
-  #       if curl -s --fail http://10.98.7.14:7777/healthz; then
-  #         echo "✅ Trivy server is UP"
-  #         trivy image --server http://10.98.7.14:7777 --timeout 8m --severity HIGH,CRITICAL --format table --output image_scanning_result.txt ${{ env.IMAGE_NAME }}:latest
-  #       else
-  #         echo "⚠️ Trivy server is DOWN. Falling back to local scan"
-  #         trivy image --timeout 8m --severity HIGH,CRITICAL --format table --output image_scanning_result.txt ${{ env.IMAGE_NAME }}:latest
-  #       fi
-
-  #       if grep -q -E 'HIGH|CRITICAL' image_scanning_result.txt; then
-  #         echo "detected_vulns=true" >> $GITHUB_OUTPUT
-  #       else
-  #         echo "detected_vulns=false" >> $GITHUB_OUTPUT
-  #       fi
-  #     continue-on-error: true
-
-      
-  #   - name: Send mail to committer if detect vulnerability in Docker image
-  #     if: steps.scan_docker_image.outputs.detected_vulns == 'true'
-  #     uses: dawidd6/action-send-mail@v4
-  #     with:
-  #       server_address: smtp.gmail.com
-  #       server_port: 465
-  #       secure: true
-  #       username: ${{vars.MAIL_USERNAME}}
-  #       password: ${{secrets.MAIL_PASSWORD}}
-  #       subject: "[ALERT] Vulnerabilities Found in Docker Image"
-  #       body: |
-  #         Hello ${{ github.event.head_commit.author.name }},
-
-  #         Detected vulnerabilities for commit:
-  #         ${{ github.server_url }}/${{ github.repository }}/commit/${{ github.event.head_commit.id }}
-
-  #         View the full report here:
-  #         ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}/job/${{ steps.get_job_id.outputs.job_id }}
-          
-  #         Please review the details and take appropriate action.
-
-  #         Best,
-  #         SRE Team
-  #       to: ${{ github.event.head_commit.author.email }}
-  #       from: kien.kim@svtech.com.vn
-
-  #   - name: Show results for Image scanning
-  #     run: |
-  #       echo "##[command] Show results for Image scanning"
-  #       cat image_scanning_result.txt
-  #     continue-on-error: true
-  #   - name: Login to GitHub Container Registry
-  #     if: github.event_name == 'push' || github.event_name == 'pull_request' || steps.check_existing_image.outputs.is_image_tag_by_commit_id_existed == 'false'
-  #     uses: docker/login-action@v2
-  #     with:
-  #       registry: ghcr.io
-  #       username: '${{ github.repository_owner }}'
-  #       password: '${{ secrets.GITHUB_TOKEN }}'
-        
-  #   - name: Push image to GitHub Container Registry
-  #     if: github.event_name == 'push' || github.event_name == 'pull_request' || steps.check_existing_image.outputs.is_image_tag_by_commit_id_existed == 'false'
-  #     run: |
-  #       docker tag ${{ env.IMAGE_NAME }}:latest ghcr.io/${{ env.REPO }}:${{ env.IMAGE_TEST_TAG }}
-  #       docker tag ${{ env.IMAGE_NAME }}:latest ghcr.io/${{ env.REPO }}:${{ env.COMMIT_SHORT_ID }}
-  #       docker push ghcr.io/${{ env.REPO }}:${{ env.IMAGE_TEST_TAG }}
-  #       docker push ghcr.io/${{ env.REPO }}:${{ env.COMMIT_SHORT_ID }}
+    - name: Push image to GitHub Container Registry
+      if: |
+        (github.event_name == 'push' || github.event_name == 'pull_request' || 
+        steps.check_existing_image.outputs.is_image_tag_by_commit_id_existed == 'false') && 
+        steps.check_commit_message.outputs.no_ci != 'true'
+      run: |
+        docker tag ${{ env.IMAGE_NAME }}:latest ghcr.io/${{ env.REPO }}:${{ env.IMAGE_TEST_TAG }}
+        docker tag ${{ env.IMAGE_NAME }}:latest ghcr.io/${{ env.REPO }}:${{ env.COMMIT_SHORT_ID }}
+        docker push ghcr.io/${{ env.REPO }}:${{ env.IMAGE_TEST_TAG }}
+        docker push ghcr.io/${{ env.REPO }}:${{ env.COMMIT_SHORT_ID }}
 
   # test:
   #   if: |
   #     github.event_name == 'push'|| 
   #     github.event_name == 'pull_request' || 
-  #     ( github.event_name == 'workflow_dispatch' && inputs.run_test ) 
+  #     ( github.event_name == 'workflow_dispatch' && inputs.run_test ) && needs.build.outputs.check_no_ci != 'true'
   #   runs-on: robot-dind
   #   needs: build
   #   permissions:
@@ -348,7 +301,7 @@ jobs:
   #         ./report.html
    
   # release: 
-  #   if: github.event_name == 'push' || github.event_name == 'pull_request'
+  #   if: (github.event_name == 'push' || github.event_name == 'pull_request') && needs.build.outputs.check_no_ci != 'true'
   #   needs: test
   #   runs-on: ubuntu-dind
   #   steps:
@@ -359,7 +312,7 @@ jobs:
   #     uses: cycjimmy/semantic-release-action@v4
   #     id: semantic
   #     env:
-  #       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  #       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} # If permission denied for protected branch, use ${{ secrets.PUSH_TOKEN }} instead.
     
   #   - name: No release published
   #     if: ${{ steps.semantic.outputs.new_release_published == 'false' }}
@@ -525,3 +478,5 @@ jobs:
   #       else 
   #         echo "No changes to commit" 
   #       fi
+      
+        
